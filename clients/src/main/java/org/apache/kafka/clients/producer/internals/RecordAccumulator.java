@@ -33,6 +33,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.kafka.clients.ApiVersions;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.record.AbstractRecords;
+import org.apache.kafka.common.record.CompressionRatioEstimator;
+import org.apache.kafka.common.record.CompressionType;
+import org.apache.kafka.common.record.MemoryRecords;
+import org.apache.kafka.common.record.MemoryRecordsBuilder;
+import org.apache.kafka.common.record.Record;
+import org.apache.kafka.common.record.RecordBatch;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.utils.ProducerIdAndEpoch;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.KafkaException;
@@ -42,14 +50,6 @@ import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.metrics.Metrics;
-import org.apache.kafka.common.record.AbstractRecords;
-import org.apache.kafka.common.record.CompressionRatioEstimator;
-import org.apache.kafka.common.record.CompressionType;
-import org.apache.kafka.common.record.MemoryRecords;
-import org.apache.kafka.common.record.MemoryRecordsBuilder;
-import org.apache.kafka.common.record.Record;
-import org.apache.kafka.common.record.RecordBatch;
-import org.apache.kafka.common.record.TimestampType;
 import org.apache.kafka.common.utils.CopyOnWriteMap;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
@@ -211,6 +211,110 @@ public class RecordAccumulator {
     private void setPartition(AppendCallbacks callbacks, int partition) {
         if (callbacks != null)
             callbacks.setPartition(partition);
+    }
+
+    public RecordAppendResult appendEmpty(String topic, int partition, long nowMs, long remainingWaitMs,
+                                          boolean abortOnNewBatch, int estimateSizeInBytesUpperBound, Cluster cluster)
+            throws InterruptedException {
+        TopicInfo topicInfo = topicInfoMap.computeIfAbsent(topic, k -> new TopicInfo(logContext, k, batchSize));
+
+        // We keep track of the number of appending thread to make sure we do not miss batches in
+        // abortIncompleteBatches().
+        appendsInProgress.incrementAndGet();
+
+        ByteBuffer buffer = free.allocate(estimateSizeInBytesUpperBound, remainingWaitMs);
+
+        // Update the current time in case the buffer allocation blocked above.
+        nowMs = time.milliseconds();
+
+        final byte[] key = null;
+        final byte[] value = null;
+        final Header[] headers = new Header[0];
+        final AppendCallbacks callbacks = null;
+        try {
+            // Loop to retry in case we encounter partitioner's race conditions.
+            while (true) {
+                // If the message doesn't have any partition affinity, so we pick a partition based on the broker
+                // availability and performance.  Note, that here we peek current partition before we hold the
+                // deque lock, so we'll need to make sure that it's not changed while we were waiting for the
+                // deque lock.
+                final BuiltInPartitioner.StickyPartitionInfo partitionInfo;
+                final int effectivePartition;
+                if (partition == RecordMetadata.UNKNOWN_PARTITION) {
+                    partitionInfo = topicInfo.builtInPartitioner.peekCurrentPartitionInfo(cluster);
+                    effectivePartition = partitionInfo.partition();
+                } else {
+                    partitionInfo = null;
+                    effectivePartition = partition;
+                }
+
+                // Now that we know the effective partition, let the caller know.
+                setPartition(callbacks, effectivePartition);
+
+                // check if we have an in-progress batch
+                Deque<ProducerBatch> dq = topicInfo.batches.computeIfAbsent(effectivePartition, k -> new ArrayDeque<>());
+                synchronized (dq) {
+                    // After taking the lock, validate that the partition hasn't changed and retry.
+                    if (topicInfo.builtInPartitioner.isPartitionChanged(partitionInfo)) {
+                        log.trace("Partition {} for topic {} switched by a concurrent append, retrying",
+                                partitionInfo.partition(), topic);
+                        continue;
+                    }
+                    RecordAppendResult appendResult = tryAppend(nowMs, key, value, headers, callbacks, dq, nowMs);
+                    if (appendResult != null) {
+                        topicInfo.builtInPartitioner.updatePartitionInfo(partitionInfo, appendResult.appendedBytes, cluster);
+                        return appendResult;
+                    }
+                }
+
+                // we don't have an in-progress record batch try to allocate a new batch
+                if (abortOnNewBatch) {
+                    // Return a result that will cause another call to append.
+                    return new RecordAppendResult(null, false, false, true, 0);
+                }
+
+                synchronized (dq) {
+                    // After taking the lock, validate that the partition hasn't changed and retry.
+                    if (topicInfo.builtInPartitioner.isPartitionChanged(partitionInfo)) {
+                        log.trace("Partition {} for topic {} switched by a concurrent append, retrying",
+                                partitionInfo.partition(), topic);
+                        continue;
+                    }
+                    MemoryRecordsBuilder builder = new MemoryRecordsBuilder(
+                            buffer,
+                            apiVersions.maxUsableProduceMagic(),
+                            compression,
+                            TimestampType.CREATE_TIME,
+                            0L,
+                            -1L,
+                            RecordBatch.NO_PRODUCER_ID,
+                            RecordBatch.NO_PRODUCER_EPOCH,
+                            RecordBatch.NO_SEQUENCE,
+                            transactionManager.isTransactional(),
+                            true,
+                            RecordBatch.NO_PARTITION_LEADER_EPOCH,
+                            estimateSizeInBytesUpperBound
+                    );
+                    final TopicPartition topicPartition = new TopicPartition(topic, partition);
+                    final ProducerBatch batch = new ProducerBatch(topicPartition, builder, nowMs);
+                    FutureRecordMetadata future = Objects.requireNonNull(batch.tryAppend(nowMs, key, value, headers,
+                            callbacks, nowMs));
+
+                    dq.addLast(batch);
+                    incomplete.add(batch);
+
+                    RecordAppendResult appendResult = new RecordAppendResult(future, dq.size() > 1 || batch.isFull(), true, false, batch.estimatedSizeInBytes());
+                    // Set buffer to null, so that deallocate doesn't return it back to free pool, since it's used in the batch.
+                    if (appendResult.newBatchCreated)
+                        buffer = null;
+                    topicInfo.builtInPartitioner.updatePartitionInfo(partitionInfo, appendResult.appendedBytes, cluster);
+                    return appendResult;
+                }
+            }
+        } finally {
+            free.deallocate(buffer);
+            appendsInProgress.decrementAndGet();
+        }
     }
 
     /**
@@ -445,6 +549,16 @@ public class RecordAccumulator {
 
     public long getDeliveryTimeoutMs() {
         return deliveryTimeoutMs;
+    }
+
+    public void enqueue(ProducerBatch batch, long now) {
+        Deque<ProducerBatch> deque = getOrCreateDeque(batch.topicPartition);
+        synchronized (deque) {
+            if (transactionManager != null)
+                insertInSequenceOrder(deque, batch);
+            else
+                deque.addFirst(batch);
+        }
     }
 
     /**
@@ -937,7 +1051,7 @@ public class RecordAccumulator {
     /**
      * Get the deque for the given topic-partition, creating it if necessary.
      */
-    private Deque<ProducerBatch> getOrCreateDeque(TopicPartition tp) {
+    public Deque<ProducerBatch> getOrCreateDeque(TopicPartition tp) {
         TopicInfo topicInfo = topicInfoMap.computeIfAbsent(tp.topic(), k -> new TopicInfo(logContext, k, batchSize));
         return topicInfo.batches.computeIfAbsent(tp.partition(), k -> new ArrayDeque<>());
     }

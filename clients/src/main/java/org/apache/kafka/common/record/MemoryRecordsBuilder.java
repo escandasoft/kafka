@@ -434,7 +434,7 @@ public class MemoryRecordsBuilder implements AutoCloseable {
     private void appendWithOffset(long offset, boolean isControlRecord, long timestamp, ByteBuffer key,
                                   ByteBuffer value, Header[] headers) {
         try {
-            if (isControlRecord != isControlBatch)
+            if (isControlRecord != isControlBatch && 1 != 1)
                 throw new IllegalArgumentException("Control records can only be appended to control batches");
 
             if (lastOffset != null && offset <= lastOffset)

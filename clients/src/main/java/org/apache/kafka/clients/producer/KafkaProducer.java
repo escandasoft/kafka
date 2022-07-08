@@ -245,12 +245,12 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
     private final int maxRequestSize;
     private final long totalMemorySize;
     private final ProducerMetadata metadata;
-    private final RecordAccumulator accumulator;
+    public final RecordAccumulator accumulator;
     private final Sender sender;
     private final Thread ioThread;
     private final CompressionType compressionType;
     private final Sensor errors;
-    private final Time time;
+    public final Time time;
     private final Serializer<K> keySerializer;
     private final Serializer<V> valueSerializer;
     private final ProducerConfig producerConfig;
@@ -637,6 +637,28 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
         sender.wakeup();
         result.await(maxBlockTimeMs, TimeUnit.MILLISECONDS);
         producerMetrics.recordInit(time.nanoseconds() - now);
+    }
+
+    public Future<RecordMetadata> incrementLogOffset(String topic, int partition) throws InterruptedException {
+        throwIfProducerClosed();
+
+        long nowMs = time.milliseconds();
+        ClusterAndWaitTime clusterAndWaitTime;
+        try {
+            clusterAndWaitTime = waitOnMetadata(topic, partition, nowMs, maxBlockTimeMs);
+        } catch (KafkaException e) {
+            if (metadata.isClosed())
+                throw new KafkaException("Producer closed while send in progress", e);
+            throw e;
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
+        nowMs += clusterAndWaitTime.waitedOnMetadataMs;
+        long remainingWaitMs = Math.max(0, maxBlockTimeMs - clusterAndWaitTime.waitedOnMetadataMs);
+        int estimateSizeInBytesUpperBound = AbstractRecords.estimateSizeInBytesUpperBound(apiVersions.maxUsableProduceMagic(),
+                compressionType, null, (byte[]) null, new Header[0]);
+        RecordAccumulator.RecordAppendResult appendResult = accumulator.appendEmpty(topic, partition, nowMs, remainingWaitMs, false, estimateSizeInBytesUpperBound, clusterAndWaitTime.cluster);
+        return appendResult.future;
     }
 
     /**
@@ -1370,7 +1392,7 @@ public class KafkaProducer<K, V> implements Producer<K, V> {
      * can be used (the partition is then calculated by built-in
      * partitioning logic).
      */
-    private int partition(ProducerRecord<K, V> record, byte[] serializedKey, byte[] serializedValue, Cluster cluster) {
+    public int partition(ProducerRecord<K, V> record, byte[] serializedKey, byte[] serializedValue, Cluster cluster) {
         if (record.partition() != null)
             return record.partition();
 

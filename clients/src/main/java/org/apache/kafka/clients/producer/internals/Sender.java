@@ -77,7 +77,7 @@ public class Sender implements Runnable {
     private final KafkaClient client;
 
     /* the record accumulator that batches records */
-    private final RecordAccumulator accumulator;
+    public final RecordAccumulator accumulator;
 
     /* the metadata for the client */
     private final ProducerMetadata metadata;
